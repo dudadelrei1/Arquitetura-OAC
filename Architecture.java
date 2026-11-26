@@ -1,3 +1,5 @@
+package architecture;
+
 import java.io.BufferedReader;
 import java.io.FileReader;
 import java.io.IOException;
@@ -7,7 +9,7 @@ import components.*;
 /**
  * Arquitetura da figura:
  *
- *   extbus1 : memória, IR, PC, REG0..REG3   
+ *   extbus1 : memória, IR, PC, REG0..REG3   (StkTOP e StkBOT NÃO estão no extbus1)
  *   intbus1 : REG0..REG3 <-> ULA
  *   intbus2 : PC, StkTOP, StkBOT <-> ULA
  *   FLAGS   : ligado à ULA (bit 0 = Zero, bit 1 = Negativo)
@@ -20,7 +22,7 @@ import components.*;
  *   addMemReg  mem %rB  : rB <- mem + rB
  *   addRegMem  %rA mem  : mem <- rA + mem
  *   addImmReg  imm %rB  : rB <- imm + rB
- *   subRegReg  %rA %rB  : rB <- rA - rB
+ *   subRegReg  %rA %rB  : rB <- rB - rA
  *   subMemReg  mem %rB  : rB <- mem - rB
  *   moveMemReg mem %rB  : rB <- mem
  *   moveRegMem %rA mem  : mem <- rA
@@ -35,9 +37,16 @@ import components.*;
  *   call addr           : empilha o endereço da próxima instrução e PC <- addr
  *   ret                 : desempilha em PC
  *
- * Pilha: cresce para cima, a partir de STACK_BASE. StkTOP aponta para a próxima
- * posição livre (StkBOT guarda a base). Programa a partir de 0, variáveis a
- * partir de 127 (para baixo), como no Assembler.
+ * Pilha: alocada logo abaixo das variáveis e em ordem DECRESCENTE.
+ *   StkBOT = posição imediatamente anterior à última variável (o "fundo")
+ *   StkTOP = próxima posição livre; começa igual a StkBOT (pilha vazia)
+ *   call : mem[StkTOP] <- endereço de retorno; StkTOP--      (push)
+ *   ret  : StkTOP++; PC <- mem[StkTOP]                        (pop)
+ *   StkTOP == StkBOT significa pilha vazia.
+ * As variáveis ficam no fim da memória (127, 126, ...), como no Assembler. Como
+ * o arquivo .dxf não informa quantas variáveis existem, o readExec descobre o
+ * menor endereço de variável usado e ajusta StkBOT/StkTOP; sem isso (ou sem
+ * variáveis) a pilha começa em 127.
  * StkTOP/StkBOT só têm ligação com a intbus2. Para endereçar a memória (extbus1),
  * o valor de StkTOP passa pelo PC (que está na intbus2 e no extbus1); para chegar
  * a um REG (intbus1) ele passa pela ULA.
@@ -48,7 +57,11 @@ import components.*;
  */
 public class Architecture {
 
-    private static final int STACK_BASE = 64;
+    // Para o readExec descobrir os endereços de variáveis, na ordem de commandsList:
+    // quantos parâmetros cada comando tem, e qual deles (1 ou 2; 0 = nenhum) é o
+    // endereço de uma variável.
+    private static final int[] PARAMS_COUNT = {2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 3, 3, 1, 0};
+    private static final int[] MEM_PARAM    = {0, 1, 2, 0, 0, 1, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 
     private boolean simulation;
     private boolean halt;
@@ -131,9 +144,13 @@ public class Architecture {
         fillRegistersList();
         fillCommandsList();
 
-        // Inicializa a pilha (StkBOT = StkTOP = STACK_BASE) pela intbus2,
-        // que é o único barramento ligado a esses registradores
-        intbus2.put(STACK_BASE);
+        // Pilha vazia, sem variáveis: StkBOT = StkTOP = última posição da memória
+        setStack(memorySize - 1);
+    }
+
+    /** Define StkBOT e StkTOP (pilha vazia) pela intbus2, o único barramento ligado a eles. */
+    private void setStack(int position) {
+        intbus2.put(position);
         StkBOT.internalStore();
         StkTOP.internalStore();
     }
@@ -196,6 +213,10 @@ public class Architecture {
     }
 
     public ArrayList<Register> getRegisterList() {
+        return registerList;
+    }
+
+    public ArrayList<Register> getRegistersList() {
         return registerList;
     }
 
@@ -424,7 +445,7 @@ public class Architecture {
         PC.internalStore();
     }
 
-    /** subRegReg %rA %rB : rB <- rA - rB */
+    /** subRegReg %rA %rB : rB <- rB - rA */
     public void subRegReg() {
         // PC++ (PC -> 1o parâmetro)
         PC.internalRead();
@@ -435,8 +456,8 @@ public class Architecture {
         PC.read();
         memory.read();                       // id de rA
         demux.setValue(extbus1.get());
-        registersInternalRead();              // valor de rA -> intbus1
-        ula.store(0);
+        registersRead();                     // valor de rA -> extbus1
+        IR.store();                          // guarda o valor de rA no IR
         // PC++ (PC -> 2o parâmetro)
         PC.internalRead();
         ula.internalStore(1);
@@ -447,7 +468,11 @@ public class Architecture {
         memory.read();                       // id de rB
         demux.setValue(extbus1.get());
         registersInternalRead();
-        ula.store(1);                        // ULA(1) = rB
+        ula.store(0);                        // ULA(0) = rB
+        IR.read();                           // valor de rA -> extbus1
+        registersStore();                    // rB <- rA (temporário; rB original está na ULA)
+        registersInternalRead();
+        ula.store(1);                        // ULA(1) = rA
         ula.sub();                           // ULA(1) = rB - rA
         ula.read(1);
         setStatusFlags(intbus1.get());
@@ -482,15 +507,15 @@ public class Architecture {
         memory.read();                       // id de rB
         demux.setValue(extbus1.get());
         registersInternalRead();
-        ula.store(1);                        // ULA(1) = rB
-        IR.read();
-        registersStore();                    // rB <- mem (temporário)
+        ula.store(1);                        // ULA(1) = rB (o valor original fica guardado na ULA)
+        IR.read();                           // valor de mem -> extbus1
+        registersStore();                    // rB <- mem (temporário; nada se perde: rB original está na ULA)
         registersInternalRead();
-        ula.store(0);                        // ULA(1) = mem
-        ula.sub();                           // ULA(1) = rB - mem
+        ula.store(0);                        // ULA(0) = mem
+        ula.sub();                           // ULA(1) = ULA(0) - ULA(1) = mem - rB
         ula.read(1);
         setStatusFlags(intbus1.get());
-        registersInternalStore();
+        registersInternalStore();            // rB <- resultado
         // PC++ (PC -> próxima instrução)
         PC.internalRead();
         ula.internalStore(1);
@@ -804,7 +829,7 @@ public class Architecture {
         PC.store();
     }
 
-    /** call addr : mem[StkTOP] <- endereço da próxima instrução; StkTOP++; PC <- addr */
+    /** call addr : mem[StkTOP] <- endereço da próxima instrução; StkTOP--; PC <- addr */
     public void call() {
         // PC++ (PC -> endereço)
         PC.internalRead();
@@ -832,22 +857,12 @@ public class Architecture {
         PC.internalStore();                  // PC <- endereço de retorno
         PC.read();                           // -> extbus1
         memory.store();                      // 2a etapa do store: dado (push)
-        // StkTOP++
-        StkTOP.internalRead();
-        ula.internalStore(1);
-        ula.inc();
-        ula.internalRead(1);
-        StkTOP.internalStore();
-        IR.read();                           // destino -> extbus1
-        PC.store();                          // PC <- destino
-    }
-
-    /** ret : StkTOP--; PC <- mem[StkTOP] */
-    public void ret() {
-        // A ULA só faz Reg1 <- Reg0 - Reg1, e Reg0 só é carregado pelo intbus1 (REGs).
-        // Truque: TOP - TOP = 0; 0 + 1 = 1; TOP - 1.
+        // StkTOP-- : a ULA só faz Reg1 <- Reg0 - Reg1, e Reg0 só é carregado pelo
+        // intbus1 (REGs). Truque: TOP - TOP = 0; 0 + 1 = 1; TOP - 1.
+        // O PC agora está livre (o retorno já está na memória e o PC receberá o
+        // destino no fim), então ele guarda REG0 temporariamente.
         REG0.read();
-        IR.store();                          // salva REG0 no IR (o opcode já foi usado)
+        PC.store();                          // PC <- REG0 (salva)
         // REG0 <- StkTOP: StkTOP só fala com a intbus2, então vai pela ULA até a intbus1
         StkTOP.internalRead();               // StkTOP -> intbus2
         ula.internalStore(1);                // ULA(1) = TOP
@@ -862,14 +877,26 @@ public class Architecture {
         ula.sub();                           // ULA(1) = TOP - 1
         ula.internalRead(1);
         StkTOP.internalStore();              // StkTOP = TOP - 1
+        PC.read();
+        REG0.store();                        // restaura REG0
+        IR.read();                           // destino -> extbus1
+        PC.store();                          // PC <- destino
+    }
+
+    /** ret : StkTOP++; PC <- mem[StkTOP] */
+    public void ret() {
+        // StkTOP++
+        StkTOP.internalRead();
+        ula.internalStore(1);
+        ula.inc();
+        ula.internalRead(1);
+        StkTOP.internalStore();
         // lê mem[StkTOP] passando pelo PC (StkTOP não está no extbus1)
         StkTOP.internalRead();               // StkTOP -> intbus2
         PC.internalStore();                  // PC <- StkTOP
         PC.read();                           // endereço do dado empilhado -> extbus1
         memory.read();                       // endereço de retorno
         PC.store();                          // PC <- retorno
-        IR.read();
-        REG0.store();                        // restaura REG0
     }
 
     // ------------------------------------------------------------------
@@ -926,9 +953,13 @@ public class Architecture {
         }
     }
 
-    /** Lê um arquivo executável (.dxf, um inteiro por linha) para a memória. */
+    /**
+     * Lê um arquivo executável (.dxf, um inteiro por linha) para a memória e
+     * posiciona a pilha logo abaixo das variáveis usadas pelo programa.
+     */
     public void readExec(String filename) throws IOException {
         BufferedReader br = new BufferedReader(new FileReader(filename + ".dxf"));
+        ArrayList<Integer> program = new ArrayList<>();
         String linha;
         int i = 0;
         while ((linha = br.readLine()) != null) {
@@ -936,13 +967,43 @@ public class Architecture {
             if (linha.isEmpty()) {
                 continue;
             }
+            int word = Integer.parseInt(linha);
+            program.add(word);
             extbus1.put(i);
             memory.store();                  // endereço
-            extbus1.put(Integer.parseInt(linha));
+            extbus1.put(word);
             memory.store();                  // dado
             i++;
         }
         br.close();
+        setStack(firstFreePosition(program));
+    }
+
+    /**
+     * Percorre o programa instrução por instrução (cada opcode tem um número fixo de
+     * parâmetros) e acha o menor endereço de variável usado. A pilha começa na
+     * posição imediatamente anterior a ele. Sem variáveis, começa na última
+     * posição da memória. Para no -1 (fim do programa) ou em qualquer opcode
+     * desconhecido.
+     */
+    private int firstFreePosition(ArrayList<Integer> program) {
+        int lowest = memorySize;             // nenhuma variável: primeira livre = memorySize - 1
+        int i = 0;
+        while (i < program.size()) {
+            int opcode = program.get(i);
+            if (opcode < 0 || opcode >= PARAMS_COUNT.length) {
+                break;
+            }
+            int param = MEM_PARAM[opcode];
+            if ((param > 0) && (i + param < program.size())) {
+                int address = program.get(i + param);
+                if ((address >= 0) && (address < lowest)) {
+                    lowest = address;
+                }
+            }
+            i += 1 + PARAMS_COUNT[opcode];
+        }
+        return Math.max(lowest - 1, 0);
     }
 
     public void read(String filename) throws IOException {
@@ -981,9 +1042,24 @@ public class Architecture {
         printRegisters();
     }
 
+    /** Mostra as posições de memória das variáveis (do fim da memória até logo acima do fundo da pilha). */
+    public void printVariables() {
+        StkBOT.internalRead();
+        int bottom = intbus2.get();
+        System.out.println("Variaveis (endereco = valor):");
+        for (int address = memorySize - 1; address > bottom; address--) {
+            extbus1.put(address);
+            memory.read();
+            System.out.println("  " + address + " = " + extbus1.get());
+        }
+    }
+
+    /** Uso: java architecture.Architecture <nome do .dxf, sem extensão>  (padrão: program) */
     public static void main(String[] args) throws IOException {
+        String name = (args.length > 0) ? args[0] : "program";
         Architecture arch = new Architecture(true);
-        arch.readExec("program");
+        arch.readExec(name);
         arch.controlUnitEexec();
+        arch.printVariables();
     }
 }
